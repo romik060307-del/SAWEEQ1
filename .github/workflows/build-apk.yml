@@ -1,0 +1,106 @@
+name: Build OHLI Social Client APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
+
+      # Cache the exact Gradle distribution so later builds do not need to download it.
+      - name: Prepare Gradle distribution cache
+        run: mkdir -p "$HOME/.gradle-dist"
+
+      - name: Restore Gradle 8.9 distribution cache
+        id: gradle-dist-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.gradle-dist/gradle-8.9
+          key: gradle-8.9-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Download Gradle 8.9 with retry and checksum verification
+        if: steps.gradle-dist-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/gradle-8.9-bin.zip"
+          expected_sha256="d725d707bfabd4dfdc958c624003b3c80accc03f7037b5122c4b1d0ef15cecab"
+          urls=(
+            "https://downloads.gradle.org/distributions/gradle-8.9-bin.zip"
+            "https://services.gradle.org/distributions/gradle-8.9-bin.zip"
+          )
+          downloaded=false
+
+          for url in "${urls[@]}"; do
+            echo "Trying official Gradle distribution: $url"
+            for attempt in 1 2 3 4 5; do
+              rm -f "$archive"
+              if curl --fail --location --show-error \
+                  --connect-timeout 20 --max-time 900 \
+                  --retry 5 --retry-all-errors --retry-delay 8 \
+                  "$url" --output "$archive"; then
+                actual_sha256="$(sha256sum "$archive" | awk '{print $1}')"
+                if [[ "$actual_sha256" != "$expected_sha256" ]]; then
+                  echo "Gradle archive checksum mismatch. Refusing to install it."
+                  echo "Expected: $expected_sha256"
+                  echo "Actual:   $actual_sha256"
+                  exit 1
+                fi
+                unzip -q "$archive" -d "$HOME/.gradle-dist"
+                downloaded=true
+                break 2
+              fi
+              echo "Download attempt $attempt failed; trying again..."
+              sleep $((attempt * 5))
+            done
+          done
+
+          if [[ "$downloaded" != "true" ]]; then
+            echo "Could not download Gradle 8.9 from the official mirrors after retries."
+            exit 1
+          fi
+          test -x "$HOME/.gradle-dist/gradle-8.9/bin/gradle"
+
+      - name: Add Gradle to PATH
+        run: echo "$HOME/.gradle-dist/gradle-8.9/bin" >> "$GITHUB_PATH"
+
+      - name: Verify Gradle installation
+        run: gradle --version
+
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.gradle/caches
+          key: gradle-dependencies-${{ runner.os }}-${{ hashFiles('**/*.gradle', '**/*.gradle.kts') }}
+          restore-keys: |
+            gradle-dependencies-${{ runner.os }}-
+
+      - name: Build debug APK
+        run: gradle :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OHLI-Social-Client-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 30
